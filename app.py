@@ -1,8 +1,3 @@
-"""CapCut account creator backend rewritten in Python.
-
-This module replicates the behaviour of the original Node.js implementation
-(app.js) using the Python standard library and third party packages.
-"""
 from __future__ import annotations
 
 import json
@@ -29,9 +24,6 @@ except Exception:  # pragma: no cover - optional dependency
     load_dotenv = None
 
 
-# ---------------------------------------------------------------------------
-# Konfigurasi dasar dan utilitas global
-# ---------------------------------------------------------------------------
 if load_dotenv is not None:
     load_dotenv()
 
@@ -62,14 +54,10 @@ API_CONFIG = {
     "check_region": "1",
 }
 
-# Domain rotation storage
 domain_lock = threading.Lock()
 DOMAINS: List[str] = []
 domain_index = 0
 
-# ---------------------------------------------------------------------------
-# Helper dataclasses
-# ---------------------------------------------------------------------------
 @dataclass
 class AccountResult:
     success: bool
@@ -85,10 +73,6 @@ class ProxyChoice:
     country: str
     proxy: Optional[str]
 
-
-# ---------------------------------------------------------------------------
-# Fungsi utilitas umum
-# ---------------------------------------------------------------------------
 def encrypt_to_target_hex(value: str) -> str:
     return "".join(f"{(ord(char) ^ 0x05):02x}" for char in value)
 
@@ -529,11 +513,6 @@ def run_create_batch(
         "countryCounts": dict(country_counts),
         "results": [result.__dict__ for result in results],
     }
-
-
-# ---------------------------------------------------------------------------
-# Utilitas input interaktif
-# ---------------------------------------------------------------------------
 
 
 def prompt_int(prompt: str, default: int, *, minimum: int = 1, maximum: Optional[int] = None) -> int:
