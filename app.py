@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import random
 import re
 import string
@@ -16,9 +15,9 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -45,8 +44,6 @@ logging.basicConfig(
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
-USAGE_DIR = ROOT / "logs"
-USAGE_FILE = USAGE_DIR / "usage.json"
 
 faker = Faker()
 
@@ -70,10 +67,6 @@ domain_lock = threading.Lock()
 DOMAINS: List[str] = []
 domain_index = 0
 
-# Usage tracking lock
-usage_lock = threading.Lock()
-
-
 # ---------------------------------------------------------------------------
 # Helper dataclasses
 # ---------------------------------------------------------------------------
@@ -85,6 +78,12 @@ class AccountResult:
     domain: str
     email: str
     password: Optional[str] = None
+
+
+@dataclass
+class ProxyChoice:
+    country: str
+    proxy: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -99,15 +98,58 @@ def _proxy_dict(proxy_url: str) -> Dict[str, str]:
     return {"http": proxy_address, "https": proxy_address}
 
 
-def get_proxy_for_country(selected_country: str, account_index: int) -> Dict[str, str]:
-    if selected_country == "ALL":
-        countries = list(PROXY_LIST.keys())
-        rotated_country = countries[account_index % len(countries)]
-        return {
-            "country": rotated_country,
-            "proxy": PROXY_LIST[rotated_country],
-        }
-    return {"country": selected_country, "proxy": PROXY_LIST[selected_country]}
+def make_proxy_selector(
+    proxy_mode: str,
+    *,
+    selected_country: Optional[str] = None,
+    proxies_map: Optional[Dict[str, str]] = None,
+    manual_proxy: Optional[str] = None,
+    manual_label: Optional[str] = None,
+) -> Tuple[Callable[[int], ProxyChoice], str]:
+    """Buat fungsi pemilih proxy berdasarkan mode yang dipilih pengguna."""
+
+    proxies_map = dict(proxies_map or {})
+    countries = list(proxies_map.keys())
+    default_country = (selected_country or DEFAULT_COUNTRY or "SG").upper()
+
+    if proxy_mode == "direct" or (proxy_mode != "manual" and not proxies_map):
+        def selector(_: int) -> ProxyChoice:
+            return ProxyChoice(country="DIRECT", proxy=None)
+
+        return selector, "Direct (tanpa proxy)"
+
+    if proxy_mode == "manual":
+        if not manual_proxy:
+            raise ValueError("Manual proxy string is required for manual mode")
+        label = (manual_label or selected_country or "CUSTOM").upper()
+
+        def selector(_: int) -> ProxyChoice:
+            return ProxyChoice(country=label, proxy=manual_proxy.strip())
+
+        return selector, f"Manual proxy ({label})"
+
+    if proxy_mode == "rotate":
+        if not countries:
+            raise ValueError("Proxy configuration kosong untuk mode rotasi")
+
+        def selector(account_index: int) -> ProxyChoice:
+            rotated = countries[account_index % len(countries)]
+            return ProxyChoice(country=rotated, proxy=proxies_map[rotated])
+
+        return selector, "Rotasi semua proxy di config.json"
+
+    if proxy_mode == "fixed":
+        if default_country not in proxies_map:
+            raise ValueError(
+                f"Proxy untuk negara {default_country} tidak ditemukan di config.json"
+            )
+
+        def selector(_: int) -> ProxyChoice:
+            return ProxyChoice(country=default_country, proxy=proxies_map[default_country])
+
+        return selector, f"Proxy {default_country} (config.json)"
+
+    raise ValueError(f"Mode proxy tidak dikenal: {proxy_mode}")
 
 
 def generate_email() -> str:
@@ -285,7 +327,7 @@ def verify_send_request(
 
 
 def create_single_account(
-    selected_country: str,
+    proxy_selector: Callable[[int], ProxyChoice],
     account_index: int,
     total_accounts: int,
     password_override: Optional[str],
@@ -296,9 +338,27 @@ def create_single_account(
     current_country = "Unknown"
 
     try:
-        proxy_info = get_proxy_for_country(selected_country, account_index)
-        proxies = _proxy_dict(proxy_info["proxy"])
-        current_country = proxy_info["country"]
+        proxy_choice = proxy_selector(account_index)
+        current_country = proxy_choice.country
+
+        if proxy_choice.proxy:
+            LOGGER.info(
+                "%s [%s/%s] Menggunakan proxy %s (%s)",
+                get_current_time(),
+                account_index + 1,
+                total_accounts,
+                proxy_choice.proxy,
+                current_country,
+            )
+            proxies = _proxy_dict(proxy_choice.proxy)
+        else:
+            LOGGER.info(
+                "%s [%s/%s] Menggunakan koneksi langsung (tanpa proxy)",
+                get_current_time(),
+                account_index + 1,
+                total_accounts,
+            )
+            proxies = {}
 
         LOGGER.info(
             "%s [%s/%s] Memeriksa alamat IP",
@@ -364,7 +424,8 @@ def create_single_account(
 
 def run_create_batch(
     *,
-    country: Optional[str],
+    proxy_selector: Callable[[int], ProxyChoice],
+    proxy_label: str,
     total: Optional[int],
     threads: Optional[int],
     password: Optional[str],
@@ -379,7 +440,6 @@ def run_create_batch(
         DOMAINS = fetched_domains
         globals()["domain_index"] = 0
 
-    selected_country = (country or DEFAULT_COUNTRY or "SG").upper()
     total_accounts = 1 if not total or total < 1 else total
     thread_count = 1 if not threads or threads < 1 else min(threads, 20)
 
@@ -409,7 +469,7 @@ def run_create_batch(
                 futures.add(
                     executor.submit(
                         create_single_account,
-                        selected_country,
+                        proxy_selector,
                         index_counter,
                         total_accounts,
                         password,
@@ -455,7 +515,8 @@ def run_create_batch(
     total_time = int(time.time() - start_time)
 
     return {
-        "selectedCountry": selected_country,
+        "selectedCountry": proxy_label,
+        "proxyLabel": proxy_label,
         "totalAccounts": total_accounts,
         "threadCount": limit,
         "successCount": success_count,
@@ -471,221 +532,190 @@ def run_create_batch(
 
 
 # ---------------------------------------------------------------------------
-# Rate limiting dan penyimpanan sederhana
+# Utilitas input interaktif
 # ---------------------------------------------------------------------------
-PORT = int(os.environ.get("PORT", "8080"))
-MAX_GLOBAL_PER_DAY = int(os.environ.get("MAX_GLOBAL_PER_DAY", "300"))
-MAX_PER_IP_PER_DAY = int(os.environ.get("MAX_PER_IP_PER_DAY", "25"))
-LOCAL_ONLY = os.environ.get("LOCAL_ONLY", "true").lower() == "true"
 
 
-def today_str() -> str:
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%d")
-
-
-def load_usage() -> Dict[str, object]:
-    if not USAGE_FILE.exists():
-        return {"date": today_str(), "global_count": 0, "per_ip": {}}
-    try:
-        with USAGE_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-    except Exception:
-        return {"date": today_str(), "global_count": 0, "per_ip": {}}
-    if data.get("date") != today_str():
-        return {"date": today_str(), "global_count": 0, "per_ip": {}}
-    if not isinstance(data.get("per_ip"), dict):
-        data["per_ip"] = {}
-    if not isinstance(data.get("global_count"), int):
-        data["global_count"] = int(data.get("global_count", 0) or 0)
-    return data
-
-
-def save_usage(data: Dict[str, object]) -> None:
-    USAGE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = USAGE_FILE.with_suffix(".tmp")
-    with tmp_path.open("w", encoding="utf-8") as temp_file:
-        json.dump(data, temp_file)
-    tmp_path.replace(USAGE_FILE)
-
-
-def get_client_ip(headers: Dict[str, str], remote_address: Tuple[str, int]) -> str:
-    x_forwarded_for = headers.get("x-forwarded-for")
-    if isinstance(x_forwarded_for, str) and x_forwarded_for:
-        return x_forwarded_for.split(",")[0].strip()
-    x_real_ip = headers.get("x-real-ip")
-    if isinstance(x_real_ip, str) and x_real_ip:
-        return x_real_ip.strip()
-    ip = remote_address[0] if remote_address else "127.0.0.1"
-    return "127.0.0.1" if ip in {"::1", "::ffff:127.0.0.1"} else ip
-
-
-def is_local_ip(ip: str) -> bool:
-    return ip in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
-
-
-# ---------------------------------------------------------------------------
-# HTTP server (BaseHTTPRequestHandler)
-# ---------------------------------------------------------------------------
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
-
-
-def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Dict[str, object]) -> None:
-    data = json.dumps(payload).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(data)))
-    handler.end_headers()
-    handler.wfile.write(data)
-
-
-class CapcutRequestHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, format: str, *args) -> None:  # pragma: no cover - silence default logging
-        LOGGER.debug("Server: " + format, *args)
-
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        parsed = urlparse(self.path)
-        headers = {k.lower(): v for k, v in self.headers.items()}
-        client_ip = get_client_ip(headers, self.client_address)
-
-        if LOCAL_ONLY and not is_local_ip(client_ip):
-            send_json(self, HTTPStatus.FORBIDDEN, {"error": "Forbidden: local access only", "ip": client_ip})
-            return
-
-        if parsed.path == "/health":
-            send_json(self, HTTPStatus.OK, {"status": "ok", "time": datetime.utcnow().isoformat()})
-            return
-        if parsed.path == "/countries":
-            send_json(
-                self,
-                HTTPStatus.OK,
-                {
-                    "availableCountries": list(PROXY_LIST.keys()),
-                    "defaultCountry": DEFAULT_COUNTRY,
-                    "info": "Tambah/ubah kode negara di config.json -> proxies",
-                    "reference": "https://www.ssl.com/id/kode-negara-a/",
-                },
-            )
-            return
-
-        send_json(self, HTTPStatus.NOT_FOUND, {"error": "Not Found"})
-
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        parsed = urlparse(self.path)
-        headers = {k.lower(): v for k, v in self.headers.items()}
-        client_ip = get_client_ip(headers, self.client_address)
-
-        if LOCAL_ONLY and not is_local_ip(client_ip):
-            send_json(self, HTTPStatus.FORBIDDEN, {"error": "Forbidden: local access only", "ip": client_ip})
-            return
-
-        if parsed.path != "/create":
-            send_json(self, HTTPStatus.NOT_FOUND, {"error": "Not Found"})
-            return
-
-        length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(length).decode("utf-8") if length else ""
-
+def prompt_int(prompt: str, default: int, *, minimum: int = 1, maximum: Optional[int] = None) -> int:
+    while True:
+        suffix = f" [{default}]" if default is not None else ""
+        raw_value = input(f"{prompt}{suffix}: ").strip()
+        if not raw_value:
+            return default
         try:
-            body = json.loads(raw_body) if raw_body else {}
-        except json.JSONDecodeError:
-            send_json(self, HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body"})
-            return
+            value = int(raw_value)
+            if value < minimum:
+                print(f"Nilai minimal adalah {minimum}.")
+                continue
+            if maximum is not None and value > maximum:
+                print(f"Nilai maksimal adalah {maximum}.")
+                continue
+            return value
+        except ValueError:
+            print("Masukkan angka yang valid.")
 
-        requested_country = body.get("country")
-        country = "ALL" if requested_country == "ALL" else (requested_country or DEFAULT_COUNTRY)
-        country = country.upper() if isinstance(country, str) else DEFAULT_COUNTRY
 
-        if country != "ALL" and country not in PROXY_LIST:
-            send_json(
-                self,
-                HTTPStatus.BAD_REQUEST,
-                {
-                    "error": f"Proxy untuk negara {country} tidak ditemukan. Atur di config.json -> proxies.",
-                    "availableCountries": list(PROXY_LIST.keys()),
-                },
-            )
-            return
+def prompt_yes_no(prompt: str, default: bool = True) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        raw_value = input(f"{prompt} [{suffix}]: ").strip().lower()
+        if not raw_value:
+            return default
+        if raw_value in {"y", "ya", "yes"}:
+            return True
+        if raw_value in {"n", "no"}:
+            return False
+        print("Jawab dengan y atau n.")
 
-        total = body.get("total")
-        threads = body.get("threads")
-        password = body.get("password")
 
-        try:
-            total_int = int(total) if total is not None else 1
-        except (TypeError, ValueError):
-            total_int = 1
+def prompt_choice(prompt: str, options: Dict[str, str], default_key: str) -> str:
+    valid_keys = set(options.keys())
+    while True:
+        raw_value = input(f"{prompt} [{default_key}]: ").strip()
+        if not raw_value:
+            return default_key
+        if raw_value in valid_keys:
+            return raw_value
+        print(f"Pilih salah satu opsi: {', '.join(valid_keys)}")
 
-        try:
-            threads_int = int(threads) if threads is not None else 1
-        except (TypeError, ValueError):
-            threads_int = 1
 
-        threads_int = max(1, min(threads_int, 2))
-        password_str = password if isinstance(password, str) and password else None
+def configure_proxy_via_input() -> Tuple[Callable[[int], ProxyChoice], str]:
+    proxies_map = CONFIG.get("proxies", {})
+    use_proxy = prompt_yes_no("Gunakan proxy?", bool(proxies_map))
 
-        with usage_lock:
-            usage = load_usage()
-            per_ip = usage.setdefault("per_ip", {})
-            ip_count = int(per_ip.get(client_ip, 0) or 0)
-            if int(usage.get("global_count", 0)) >= MAX_GLOBAL_PER_DAY:
-                send_json(self, HTTPStatus.TOO_MANY_REQUESTS, {"error": "Daily global limit reached", "limit": MAX_GLOBAL_PER_DAY})
-                return
-            if ip_count >= MAX_PER_IP_PER_DAY:
-                send_json(
-                    self,
-                    HTTPStatus.TOO_MANY_REQUESTS,
-                    {"error": "Daily per-IP limit reached", "limit": MAX_PER_IP_PER_DAY, "ip": client_ip},
+    if not use_proxy:
+        return make_proxy_selector("direct")
+
+    available_countries = list(proxies_map.keys())
+    option_map: Dict[str, str] = {}
+    option_index = 1
+
+    print("\nMode proxy yang tersedia:")
+    if available_countries:
+        option_map[str(option_index)] = "rotate"
+        print(f"  {option_index}. Rotasi semua proxy dari config.json")
+        option_index += 1
+
+        option_map[str(option_index)] = "fixed"
+        print(f"  {option_index}. Gunakan negara tertentu dari config.json")
+        option_index += 1
+
+    option_map[str(option_index)] = "manual"
+    print(f"  {option_index}. Masukkan proxy manual")
+
+    choice = prompt_choice("Pilih mode proxy", option_map, next(iter(option_map)))
+    selected_mode = option_map[choice]
+
+    if selected_mode == "rotate":
+        return make_proxy_selector("rotate", proxies_map=proxies_map)
+
+    if selected_mode == "fixed":
+        default_country = (DEFAULT_COUNTRY or (available_countries[0] if available_countries else "SG")).upper()
+        while True:
+            country_input = input(
+                f"Masukkan kode negara yang tersedia ({', '.join(available_countries)}) [{default_country}]: "
+            ).strip()
+            country_code = (country_input or default_country).upper()
+            if country_code in proxies_map:
+                return make_proxy_selector(
+                    "fixed",
+                    selected_country=country_code,
+                    proxies_map=proxies_map,
                 )
-                return
+            print("Kode negara tidak ditemukan di config.json.")
 
-        LOGGER.info(
-            "\n🚀 Memulai batch create via API | country=%s total=%s threads=%s",
-            country,
-            total_int,
-            threads_int,
-        )
+    manual_proxy = ""
+    while not manual_proxy:
+        manual_proxy = input("Masukkan proxy manual (misal user:pass@host:port): ").strip()
+        if not manual_proxy:
+            print("Proxy tidak boleh kosong.")
+    manual_label = input("Label/negara untuk proxy ini [CUSTOM]: ").strip() or "CUSTOM"
+    return make_proxy_selector(
+        "manual",
+        selected_country=manual_label,
+        manual_proxy=manual_proxy,
+        manual_label=manual_label,
+    )
 
-        try:
-            summary = run_create_batch(
-                country=country,
-                total=total_int,
-                threads=threads_int,
-                password=password_str,
+
+def print_summary(summary: Dict[str, object]) -> None:
+    print("\n=== Ringkasan ===")
+    print(f"Mode proxy   : {summary.get('proxyLabel', 'N/A')}")
+    print(f"Total akun   : {summary.get('totalAccounts')}")
+    print(f"Sukses       : {summary.get('successCount')}")
+    print(f"Gagal        : {summary.get('failCount')}")
+    print(f"Waktu proses : {summary.get('totalTimeSeconds')} detik")
+
+    successes = summary.get("successes") or []
+    if successes:
+        print("\nAkun berhasil (email | password | negara):")
+        for index, account in enumerate(successes, start=1):
+            print(
+                f"  {index}. {account.get('email')} | {account.get('password')} | {account.get('country')}"
             )
-        except Exception as exc:
-            LOGGER.error("API Error: %s", exc)
-            send_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
-            return
+    else:
+        print("\nTidak ada akun yang berhasil dibuat pada batch ini.")
 
-        to_add = int(summary.get("successCount", 0) or 0)
-        if to_add > 0:
-            with usage_lock:
-                updated = load_usage()
-                updated["global_count"] = int(updated.get("global_count", 0) or 0) + to_add
-                per_ip = updated.setdefault("per_ip", {})
-                per_ip[client_ip] = int(per_ip.get(client_ip, 0) or 0) + to_add
-                save_usage(updated)
+    country_counts = summary.get("countryCounts") or {}
+    if country_counts:
+        print("\nStatistik negara:")
+        for country, count in sorted(country_counts.items()):
+            print(f"  {country}: {count}")
 
-        send_json(self, HTTPStatus.OK, summary)
+    domain_counts = summary.get("domainCounts") or {}
+    if domain_counts:
+        print("\nDomain yang terpakai:")
+        for domain, count in sorted(domain_counts.items(), key=lambda item: item[1], reverse=True):
+            print(f"  {domain}: {count}")
+
+    ip_set = summary.get("ipSet") or []
+    if ip_set:
+        print("\nIP yang digunakan:")
+        for value in ip_set:
+            print(f"  - {value}")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 def main() -> None:
-    server = ThreadingHTTPServer(("", PORT), CapcutRequestHandler)
+    print("=" * 60)
+    print("CapCut Account Generator - Mode Lokal")
+    print("=" * 60)
+
+    total_accounts = prompt_int("Jumlah akun yang ingin dibuat", 1, minimum=1)
+    thread_limit = prompt_int("Jumlah thread paralel (maks 20)", 1, minimum=1, maximum=20)
+    total_threads = min(thread_limit, total_accounts)
+
+    password_input = input("Password akun (kosong = gunakan dari config.json): ").strip()
+    password_override = password_input or None
+
+    proxy_selector, proxy_label = configure_proxy_via_input()
+
+    print("\nKonfigurasi yang dipakai:")
+    print(f"- Mode proxy    : {proxy_label}")
+    print(f"- Total akun    : {total_accounts}")
+    print(f"- Thread paralel: {total_threads}")
+    print(
+        "- Password      : "
+        + ("(pakai default dari config.json)" if password_override is None else "(manual)")
+    )
+
+    if not prompt_yes_no("Lanjutkan pembuatan akun?", True):
+        print("Dibatalkan oleh pengguna.")
+        return
+
     try:
-        LOGGER.info("🚀 Backend berjalan di http://localhost:%s", PORT)
-        server.serve_forever()
-    except KeyboardInterrupt:  # pragma: no cover - manual stop
-        LOGGER.info("Server dihentikan oleh pengguna")
-    finally:
-        server.server_close()
+        summary = run_create_batch(
+            proxy_selector=proxy_selector,
+            proxy_label=proxy_label,
+            total=total_accounts,
+            threads=total_threads,
+            password=password_override,
+        )
+    except Exception as exc:  # pragma: no cover - interaktif manual
+        LOGGER.error("Gagal menjalankan batch: %s", exc)
+        print(f"\n❌ Terjadi kesalahan: {exc}")
+        return
+
+    print_summary(summary)
 
 
 if __name__ == "__main__":
